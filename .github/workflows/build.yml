@@ -23,6 +23,10 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Syntax check
+        run: |
+          python -m py_compile app.py
+
       - name: Build EXE
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --name ProspectHunter --collect-all playwright app.py
@@ -32,6 +36,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item dist\ProspectHunter.exe release\ProspectHunter.exe
+          Copy-Item START_ProspectHunter.bat release\START_ProspectHunter.bat
           Copy-Item README.md release\README.md
           Compress-Archive -Path release\* -DestinationPath ProspectHunter-Windows.zip -Force
 
