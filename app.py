@@ -399,7 +399,7 @@ class App:
         self.title_var = tk.StringVar()
         self.location = tk.StringVar()
         self.pages = tk.IntVar(value=10)
-        self.delay = tk.DoubleVar(value=2.0)
+        self.delay = tk.DoubleVar(value=10.0)
         self.output = tk.StringVar(value=str(DEFAULT_OUTPUT))
         self.visit_profiles = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
@@ -434,7 +434,7 @@ class App:
         opts.pack(fill="x", pady=12)
         ttk.Label(opts, text="Pages").grid(row=0, column=0, padx=8, pady=6, sticky="w")
         ttk.Spinbox(opts, from_=1, to=500, textvariable=self.pages, width=8).grid(row=0, column=1, padx=8, pady=6, sticky="w")
-        ttk.Label(opts, text="Delay / page (sec)").grid(row=0, column=2, padx=8, pady=6, sticky="w")
+        ttk.Label(opts, text="Delay / page (sec) — default 10").grid(row=0, column=2, padx=8, pady=6, sticky="w")
         ttk.Spinbox(opts, from_=0.5, to=30, increment=0.5, textvariable=self.delay, width=8).grid(row=0, column=3, padx=8, pady=6, sticky="w")
         ttk.Checkbutton(opts, text="Visit profiles for extra visible details", variable=self.visit_profiles).grid(row=0, column=4, padx=12, pady=6, sticky="w")
 
