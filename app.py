@@ -20,6 +20,48 @@ APP_NAME = "ProspectHunter"
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / APP_NAME
 PROFILE_DIR = APP_DIR / "ChromeProfile"
 DEFAULT_OUTPUT = Path.home() / "Desktop" / "ProspectHunter_Output.xlsx"
+STATE_FILE = APP_DIR / "daily_state.json"
+
+
+class DailyLimit:
+    def __init__(self, max_profiles=20, max_searches=5):
+        self.max_profiles = max_profiles
+        self.max_searches = max_searches
+        self.profiles = 0
+        self.searches = 0
+        self.day = time.strftime("%Y-%m-%d")
+        self._load()
+
+    def _load(self):
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if data.get("day") == self.day:
+                self.profiles = int(data.get("profiles", 0))
+                self.searches = int(data.get("searches", 0))
+        except Exception:
+            pass
+
+    def _save(self):
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps({
+            "day": self.day,
+            "profiles": self.profiles,
+            "searches": self.searches
+        }), encoding="utf-8")
+
+    def can_search(self):
+        return self.searches < self.max_searches
+
+    def can_profile(self):
+        return self.profiles < self.max_profiles
+
+    def register_search(self):
+        self.searches += 1
+        self._save()
+
+    def register_profile(self):
+        self.profiles += 1
+        self._save()
 
 
 @dataclass
@@ -266,6 +308,8 @@ class ProspectHunter:
         self.pause_event.clear()
         found = new = 0
         records = {}
+        limits = DailyLimit(max_profiles=int(settings["max_profiles"]), max_searches=int(settings["max_searches"]))
+        self.ui.put(("limits", limits.profiles, limits.max_profiles, limits.searches, limits.max_searches))
         try:
             target = self.build_url(settings["search_url"], settings["keywords"], settings["title"], settings["location"])
             max_pages = max(1, int(settings["pages"]))
@@ -284,6 +328,12 @@ class ProspectHunter:
 
                 for page_no in range(1, max_pages + 1):
                     if self.stop_event.is_set():
+                        break
+                    if not limits.can_search():
+                        self.log(f"Daily search limit reached: {limits.searches}/{limits.max_searches}.")
+                        break
+                    limits.register_search()
+                    self.ui.put(("limits", limits.profiles, limits.max_profiles, limits.searches, limits.max_searches))
                         break
                     while self.pause_event.is_set() and not self.stop_event.is_set():
                         time.sleep(0.5)
@@ -304,7 +354,9 @@ class ProspectHunter:
                     before = len(records)
 
                     for card in cards:
-                        if self.stop_event.is_set():
+                        if self.stop_event.is_set() or not limits.can_profile():
+                            if not limits.can_profile():
+                                self.log(f"Daily profile limit reached: {limits.profiles}/{limits.max_profiles}.")
                             break
                         while self.pause_event.is_set() and not self.stop_event.is_set():
                             time.sleep(0.5)
@@ -315,6 +367,8 @@ class ProspectHunter:
                         if key not in records:
                             records[key] = lead
                             new += 1
+                            limits.register_profile()
+                            self.ui.put(("limits", limits.profiles, limits.max_profiles, limits.searches, limits.max_searches))
                         found += 1
                         self.count(found, new)
 
@@ -402,7 +456,10 @@ class App:
         self.delay = tk.DoubleVar(value=10.0)
         self.output = tk.StringVar(value=str(DEFAULT_OUTPUT))
         self.visit_profiles = tk.BooleanVar(value=False)
+        self.max_profiles = tk.IntVar(value=20)
+        self.max_searches = tk.IntVar(value=5)
         self.status = tk.StringVar(value="Ready")
+        self.limit_status = tk.StringVar(value="Today: 0/20 profiles | 0/5 searches")
         self.found = tk.IntVar(value=0)
         self.new = tk.IntVar(value=0)
 
@@ -437,6 +494,10 @@ class App:
         ttk.Label(opts, text="Delay / page (sec) — default 10").grid(row=0, column=2, padx=8, pady=6, sticky="w")
         ttk.Spinbox(opts, from_=0.5, to=30, increment=0.5, textvariable=self.delay, width=8).grid(row=0, column=3, padx=8, pady=6, sticky="w")
         ttk.Checkbutton(opts, text="Visit profiles for extra visible details", variable=self.visit_profiles).grid(row=0, column=4, padx=12, pady=6, sticky="w")
+        ttk.Label(opts, text="Profiles/day").grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(opts, from_=1, to=5000, textvariable=self.max_profiles, width=8).grid(row=1, column=1, padx=8, pady=6, sticky="w")
+        ttk.Label(opts, text="Searches/day").grid(row=1, column=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(opts, from_=1, to=500, textvariable=self.max_searches, width=8).grid(row=1, column=3, padx=8, pady=6, sticky="w")
 
         out = ttk.Frame(outer)
         out.pack(fill="x", pady=(0, 10))
@@ -454,6 +515,7 @@ class App:
         stats = ttk.Frame(outer)
         stats.pack(fill="x", pady=6)
         ttk.Label(stats, textvariable=self.status, font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Label(stats, textvariable=self.limit_status).pack(side="left", padx=(20, 0))
         ttk.Label(stats, text="   Seen:").pack(side="left")
         ttk.Label(stats, textvariable=self.found).pack(side="left")
         ttk.Label(stats, text="   New:").pack(side="left")
@@ -491,6 +553,8 @@ class App:
                 "delay": float(self.delay.get()),
                 "output": self.output.get(),
                 "visit_profiles": bool(self.visit_profiles.get()),
+                "max_profiles": int(self.max_profiles.get()),
+                "max_searches": int(self.max_searches.get()),
             }
             self.status.set("RUNNING")
             self.found.set(0)
@@ -509,6 +573,8 @@ class App:
                 elif item[0] == "count":
                     self.found.set(item[1])
                     self.new.set(item[2])
+                elif item[0] == "limits":
+                    self.limit_status.set(f"Today: {item[1]}/{item[2]} profiles | {item[3]}/{item[4]} searches")
                 elif item[0] == "done":
                     self.status.set("FINISHED")
                     self.add_log(f"Output: {item[1]} ({item[2]} unique)")
