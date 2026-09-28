@@ -22,6 +22,13 @@ PROFILE_DIR = APP_DIR / "ChromeProfile"
 STATE_FILE = APP_DIR / "daily_state.json"
 DEFAULT_OUTPUT = Path.home() / "Desktop" / "ProspectHunter_Output.xlsx"
 
+LANGUAGES = {
+    "English": {"subtitle":"LinkedIn search collector — Chrome only","search":"Search","keywords":"Keywords","title":"Title / role","location":"Location","url":"Exact LinkedIn search URL (optional)","options":"Run options","pages":"Pages","delay":"Delay / page (sec)","visit":"Visit profiles for extra visible details","profiles":"Profiles/day","searches":"Searches/day","output":"Excel output","browse":"Browse","start":"START","pause":"PAUSE","resume":"RESUME","stop":"STOP","running":"RUNNING","finished":"FINISHED","error":"ERROR","today":"Today","seen":"Seen:","new":"New:","language":"Language","readylog":"Ready. Sign in to LinkedIn manually in Chrome when prompted.","starting":"Starting…","finished_msg":"Finished.\\n\\n{} unique contacts exported to:\\n{}","output_log":"Output: {} ({} unique)"},
+    "Svenska": {"subtitle":"LinkedIn-sökning — endast Chrome","search":"Sök","keywords":"Sökord","title":"Titel / roll","location":"Plats","url":"Exakt LinkedIn-sök-URL (valfritt)","options":"Köralternativ","pages":"Sidor","delay":"Fördröjning / sida (sek)","visit":"Besök profiler för extra synliga uppgifter","profiles":"Profiler/dag","searches":"Sökningar/dag","output":"Excel-utdata","browse":"Bläddra","start":"START","pause":"PAUS","resume":"FORTSÄTT","stop":"STOPP","running":"KÖR","finished":"KLAR","error":"FEL","today":"Idag","seen":"Sedda:","new":"Nya:","language":"Språk","readylog":"Klar. Logga in manuellt på LinkedIn i Chrome när du blir ombedd.","starting":"Startar…","finished_msg":"Klart.\\n\\n{} unika kontakter exporterades till:\\n{}","output_log":"Utdata: {} ({} unika)"},
+    "Português (Brasil)": {"subtitle":"Coletor de buscas do LinkedIn — somente Chrome","search":"Pesquisa","keywords":"Palavras-chave","title":"Cargo / função","location":"Localização","url":"URL exata da busca do LinkedIn (opcional)","options":"Opções de execução","pages":"Páginas","delay":"Atraso / página (seg)","visit":"Visitar perfis para detalhes visíveis extras","profiles":"Perfis/dia","searches":"Pesquisas/dia","output":"Saída Excel","browse":"Procurar","start":"INICIAR","pause":"PAUSAR","resume":"CONTINUAR","stop":"PARAR","running":"EXECUTANDO","finished":"CONCLUÍDO","error":"ERRO","today":"Hoje","seen":"Vistos:","new":"Novos:","language":"Idioma","readylog":"Pronto. Faça login manualmente no LinkedIn pelo Chrome quando solicitado.","starting":"Iniciando…","finished_msg":"Concluído.\\n\\n{} contatos únicos exportados para:\\n{}","output_log":"Saída: {} ({} únicos)"}
+}
+
+
 
 @dataclass
 class Lead:
@@ -101,8 +108,9 @@ class ProspectHunter:
         self.ui.put(("log", message))
 
     def limits(self, limit):
-        self.ui.put(("limits", limit.profiles, limit.max_profiles,
-                     limit.searches, limit.max_searches))
+        self.last_profiles = limit.profiles
+        self.last_searches = limit.searches
+        self.ui.put(("limits", limit.profiles, limit.max_profiles, limit.searches, limit.max_searches))
 
     def build_url(self, search_url, keywords, title, location):
         if search_url.strip():
@@ -481,69 +489,130 @@ class App:
         self.max_profiles = tk.IntVar(value=20)
         self.max_searches = tk.IntVar(value=5)
         self.status = tk.StringVar(value="Ready")
+        self.language = tk.StringVar(value="English")
         self.limit_status = tk.StringVar(value="Today: 0/20 profiles | 0/5 searches")
         self.found = tk.IntVar(value=0)
         self.new = tk.IntVar(value=0)
         self.build_ui()
         self.root.after(250, self.poll)
 
+    def t(self, key):
+        return LANGUAGES[self.language.get()].get(key, key)
+
     def build_ui(self):
+        for child in self.root.winfo_children():
+            child.destroy()
+
         outer = ttk.Frame(self.root, padding=16)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="PROSPECT HUNTER", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="LinkedIn search collector — Chrome only").pack(anchor="w", pady=(0, 12))
+        header = ttk.Frame(outer)
+        header.pack(fill="x")
+        ttk.Label(header, text="PROSPECT HUNTER", font=("Segoe UI", 18, "bold")).pack(side="left")
+        lang_frame = ttk.Frame(header)
+        lang_frame.pack(side="right")
+        ttk.Label(lang_frame, text=self.t("language")).pack(side="left", padx=(0, 6))
+        ttk.Combobox(lang_frame, textvariable=self.language,
+                     values=list(LANGUAGES.keys()), state="readonly", width=20).pack(side="left")
+        self.language.trace_add("write", self.change_language)
 
-        form = ttk.LabelFrame(outer, text="Search")
+        self.subtitle_label = ttk.Label(outer, text=self.t("subtitle"))
+        self.subtitle_label.pack(anchor="w", pady=(0, 12))
+
+        form = ttk.LabelFrame(outer, text=self.t("search"))
         form.pack(fill="x")
-        rows = [
-            ("Keywords", self.keywords),
-            ("Title / role", self.title_var),
-            ("Location", self.location),
-            ("Exact LinkedIn search URL (optional)", self.search_url),
-        ]
-        for row, (label, var) in enumerate(rows):
-            ttk.Label(form, text=label, width=30).grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        self.form = form
+        self.form_labels = []
+        rows = [("keywords", self.keywords), ("title", self.title_var),
+                ("location", self.location), ("url", self.search_url)]
+        for row, (key, var) in enumerate(rows):
+            label = ttk.Label(form, text=self.t(key), width=30)
+            label.grid(row=row, column=0, sticky="w", padx=8, pady=6)
+            self.form_labels.append((key, label))
             ttk.Entry(form, textvariable=var).grid(row=row, column=1, sticky="ew", padx=8, pady=6)
         form.columnconfigure(1, weight=1)
 
-        opts = ttk.LabelFrame(outer, text="Run options")
+        opts = ttk.LabelFrame(outer, text=self.t("options"))
         opts.pack(fill="x", pady=12)
-        ttk.Label(opts, text="Pages").grid(row=0, column=0, padx=8, pady=6, sticky="w")
+        self.opts = opts
+        self.option_labels = []
+        def ol(key, row, col):
+            w = ttk.Label(opts, text=self.t(key))
+            w.grid(row=row, column=col, padx=8, pady=6, sticky="w")
+            self.option_labels.append((key, w))
+        ol("pages", 0, 0)
         ttk.Spinbox(opts, from_=1, to=500, textvariable=self.pages, width=8).grid(row=0, column=1, padx=8, pady=6, sticky="w")
-        ttk.Label(opts, text="Delay / page (sec)").grid(row=0, column=2, padx=8, pady=6, sticky="w")
+        ol("delay", 0, 2)
         ttk.Spinbox(opts, from_=1, to=60, increment=1, textvariable=self.delay, width=8).grid(row=0, column=3, padx=8, pady=6, sticky="w")
-        ttk.Checkbutton(opts, text="Visit profiles for extra visible details", variable=self.visit_profiles).grid(row=0, column=4, padx=12, pady=6, sticky="w")
-        ttk.Label(opts, text="Profiles/day").grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        self.visit_check = ttk.Checkbutton(opts, text=self.t("visit"), variable=self.visit_profiles)
+        self.visit_check.grid(row=0, column=4, padx=12, pady=6, sticky="w")
+        ol("profiles", 1, 0)
         ttk.Spinbox(opts, from_=1, to=5000, textvariable=self.max_profiles, width=8).grid(row=1, column=1, padx=8, pady=6, sticky="w")
-        ttk.Label(opts, text="Searches/day").grid(row=1, column=2, padx=8, pady=6, sticky="w")
+        ol("searches", 1, 2)
         ttk.Spinbox(opts, from_=1, to=500, textvariable=self.max_searches, width=8).grid(row=1, column=3, padx=8, pady=6, sticky="w")
 
         out = ttk.Frame(outer)
         out.pack(fill="x", pady=(0, 10))
-        ttk.Label(out, text="Excel output").pack(side="left")
+        self.output_label = ttk.Label(out, text=self.t("output"))
+        self.output_label.pack(side="left")
         ttk.Entry(out, textvariable=self.output).pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(out, text="Browse", command=self.browse).pack(side="left")
+        self.browse_button = ttk.Button(out, text=self.t("browse"), command=self.browse)
+        self.browse_button.pack(side="left")
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=6)
-        ttk.Button(buttons, text="START", command=self.start).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="PAUSE", command=self.engine.pause).pack(side="left", padx=6)
-        ttk.Button(buttons, text="RESUME", command=self.engine.resume).pack(side="left", padx=6)
-        ttk.Button(buttons, text="STOP", command=self.engine.stop).pack(side="left", padx=6)
+        self.start_button = ttk.Button(buttons, text=self.t("start"), command=self.start)
+        self.start_button.pack(side="left", padx=(0, 6))
+        self.pause_button = ttk.Button(buttons, text=self.t("pause"), command=self.engine.pause)
+        self.pause_button.pack(side="left", padx=6)
+        self.resume_button = ttk.Button(buttons, text=self.t("resume"), command=self.engine.resume)
+        self.resume_button.pack(side="left", padx=6)
+        self.stop_button = ttk.Button(buttons, text=self.t("stop"), command=self.engine.stop)
+        self.stop_button.pack(side="left", padx=6)
 
         stats = ttk.Frame(outer)
         stats.pack(fill="x", pady=6)
         ttk.Label(stats, textvariable=self.status, font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Label(stats, textvariable=self.limit_status).pack(side="left", padx=(20, 0))
-        ttk.Label(stats, text="   Seen:").pack(side="left")
+        self.limit_status_label = ttk.Label(stats, textvariable=self.limit_status)
+        self.limit_status_label.pack(side="left", padx=(20, 0))
+        self.seen_label = ttk.Label(stats, text=self.t("seen"))
+        self.seen_label.pack(side="left")
         ttk.Label(stats, textvariable=self.found).pack(side="left")
-        ttk.Label(stats, text="   New:").pack(side="left")
+        self.new_label = ttk.Label(stats, text=self.t("new"))
+        self.new_label.pack(side="left")
         ttk.Label(stats, textvariable=self.new).pack(side="left")
 
         self.log = tk.Text(outer, height=20, wrap="word")
         self.log.pack(fill="both", expand=True, pady=(8, 0))
-        self.log.insert("end", "Ready. Sign in to LinkedIn manually in Chrome when prompted.\n")
+        self.log.insert("end", self.t("readylog") + "\n")
         self.log.configure(state="disabled")
+
+    def change_language(self, *_):
+        if not hasattr(self, "subtitle_label"):
+            return
+        self.root.title(APP_NAME + " — " + self.language.get())
+        self.subtitle_label.config(text=self.t("subtitle"))
+        self.form.config(text=self.t("search"))
+        self.opts.config(text=self.t("options"))
+        for key, widget in self.form_labels + self.option_labels:
+            widget.config(text=self.t(key))
+        self.visit_check.config(text=self.t("visit"))
+        self.output_label.config(text=self.t("output"))
+        self.browse_button.config(text=self.t("browse"))
+        self.start_button.config(text=self.t("start"))
+        self.pause_button.config(text=self.t("pause"))
+        self.resume_button.config(text=self.t("resume"))
+        self.stop_button.config(text=self.t("stop"))
+        self.seen_label.config(text=self.t("seen"))
+        self.new_label.config(text=self.t("new"))
+        self.update_limit_text()
+
+    def update_limit_text(self):
+        profiles = getattr(self.engine, "last_profiles", 0)
+        searches = getattr(self.engine, "last_searches", 0)
+        self.limit_status.set(
+            f"{self.t('today')}: {profiles}/{self.max_profiles.get()} profiles | "
+            f"{searches}/{self.max_searches.get()} searches"
+        )
 
     def browse(self):
         path = filedialog.asksaveasfilename(
@@ -575,10 +644,10 @@ class App:
                 "max_profiles": int(self.max_profiles.get()),
                 "max_searches": int(self.max_searches.get()),
             }
-            self.status.set("RUNNING")
+            self.status.set(self.t("running"))
             self.found.set(0)
             self.new.set(0)
-            self.add_log("Starting…")
+            self.add_log(self.t("starting"))
             self.engine.start(settings)
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
@@ -593,15 +662,15 @@ class App:
                     self.found.set(item[1])
                     self.new.set(item[2])
                 elif item[0] == "limits":
-                    self.limit_status.set(
-                        f"Today: {item[1]}/{item[2]} profiles | {item[3]}/{item[4]} searches"
-                    )
+                    self.engine.last_profiles = item[1]
+                    self.engine.last_searches = item[3]
+                    self.update_limit_text()
                 elif item[0] == "done":
-                    self.status.set("FINISHED")
-                    self.add_log(f"Output: {item[1]} ({item[2]} unique)")
-                    messagebox.showinfo(APP_NAME, f"Finished.\n\n{item[2]} unique contacts exported to:\n{item[1]}")
+                    self.status.set(self.t("finished"))
+                    self.add_log(self.t("output_log").format(item[1], item[2]))
+                    messagebox.showinfo(APP_NAME, self.t("finished_msg").format(item[2], item[1]))
                 elif item[0] == "error":
-                    self.status.set("ERROR")
+                    self.status.set(self.t("error"))
                     messagebox.showerror(APP_NAME, item[1])
                 self.q.task_done()
         except queue.Empty:
