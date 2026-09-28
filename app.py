@@ -1,38 +1,64 @@
 import csv
+import json
 import os
 import queue
 import re
 import threading
 import time
-import webbrowser
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 from openpyxl import Workbook
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 APP_NAME = "ProspectHunter"
-APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / APP_NAME
+APP_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 PROFILE_DIR = APP_DIR / "ChromeProfile"
-DEFAULT_OUTPUT = Path.home() / "Desktop" / "ProspectHunter_Output.xlsx"
 STATE_FILE = APP_DIR / "daily_state.json"
+DEFAULT_OUTPUT = Path.home() / "Desktop" / "ProspectHunter_Output.xlsx"
+
+
+@dataclass
+class Lead:
+    name: str = ""
+    headline: str = ""
+    location: str = ""
+    company: str = ""
+    profile_url: str = ""
+    snippet: str = ""
+    source: str = "LinkedIn"
+    collected_at: str = ""
+
+
+def clean(value):
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def unique_lines(value):
+    seen, result = set(), []
+    for line in (value or "").splitlines():
+        line = clean(line)
+        if line and line.lower() not in seen:
+            seen.add(line.lower())
+            result.append(line)
+    return result
 
 
 class DailyLimit:
     def __init__(self, max_profiles=20, max_searches=5):
         self.max_profiles = max_profiles
         self.max_searches = max_searches
+        self.day = time.strftime("%Y-%m-%d")
         self.profiles = 0
         self.searches = 0
-        self.day = time.strftime("%Y-%m-%d")
-        self._load()
+        self.load()
 
-    def _load(self):
+    def load(self):
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             if data.get("day") == self.day:
@@ -41,7 +67,7 @@ class DailyLimit:
         except Exception:
             pass
 
-    def _save(self):
+    def save(self):
         APP_DIR.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps({
             "day": self.day,
@@ -57,42 +83,15 @@ class DailyLimit:
 
     def register_search(self):
         self.searches += 1
-        self._save()
+        self.save()
 
     def register_profile(self):
         self.profiles += 1
-        self._save()
-
-
-@dataclass
-class Lead:
-    name: str = ""
-    headline: str = ""
-    location: str = ""
-    company: str = ""
-    profile_url: str = ""
-    snippet: str = ""
-    source: str = "LinkedIn"
-    collected_at: str = ""
-
-
-def clean(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def unique_lines(text: str):
-    out = []
-    seen = set()
-    for raw in (text or "").splitlines():
-        value = clean(raw)
-        if value and value.lower() not in seen:
-            seen.add(value.lower())
-            out.append(value)
-    return out
+        self.save()
 
 
 class ProspectHunter:
-    def __init__(self, ui_queue: queue.Queue):
+    def __init__(self, ui_queue):
         self.ui = ui_queue
         self.thread = None
         self.stop_event = threading.Event()
@@ -101,26 +100,28 @@ class ProspectHunter:
     def log(self, message):
         self.ui.put(("log", message))
 
-    def count(self, found, new):
-        self.ui.put(("count", found, new))
+    def limits(self, limit):
+        self.ui.put(("limits", limit.profiles, limit.max_profiles,
+                     limit.searches, limit.max_searches))
 
     def build_url(self, search_url, keywords, title, location):
         if search_url.strip():
             return search_url.strip()
-        parts = [keywords.strip(), title.strip(), location.strip()]
-        query = " ".join(p for p in parts if p)
+        query = " ".join(x.strip() for x in (keywords, title, location) if x.strip())
         if not query:
             raise ValueError("Enter keywords/title/location or paste a LinkedIn search URL.")
         return "https://www.linkedin.com/search/results/people/?keywords=" + quote_plus(query)
 
-    def next_page_url(self, url, page_no):
-        parts = urlparse(url)
+    def page_url(self, base_url, page_no):
+        parts = urlparse(base_url)
         params = dict(parse_qsl(parts.query, keep_blank_values=True))
         params["page"] = str(page_no)
-        return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, urlencode(params), parts.fragment))
+        return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params,
+                           urlencode(params), parts.fragment))
 
     def launch_chrome(self, pw):
         APP_DIR.mkdir(parents=True, exist_ok=True)
+        errors = []
         try:
             return pw.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
@@ -129,298 +130,319 @@ class ProspectHunter:
                 viewport={"width": 1440, "height": 900},
                 args=["--start-maximized"],
             )
-        except Exception as first_error:
-            candidates = [
-                os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-            ]
-            for exe in candidates:
-                if os.path.exists(exe):
-                    try:
-                        return pw.chromium.launch_persistent_context(
-                            user_data_dir=str(PROFILE_DIR),
-                            executable_path=exe,
-                            headless=False,
-                            viewport={"width": 1440, "height": 900},
-                            args=["--start-maximized"],
-                        )
-                    except Exception:
-                        pass
-            raise RuntimeError(f"Could not start Google Chrome. {first_error}")
+        except Exception as exc:
+            errors.append(str(exc))
+
+        candidates = [
+            os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+        for exe in candidates:
+            if os.path.exists(exe):
+                try:
+                    return pw.chromium.launch_persistent_context(
+                        user_data_dir=str(PROFILE_DIR),
+                        executable_path=exe,
+                        headless=False,
+                        viewport={"width": 1440, "height": 900},
+                        args=["--start-maximized"],
+                    )
+                except Exception as exc:
+                    errors.append(str(exc))
+        raise RuntimeError("Could not start Google Chrome. " + " | ".join(errors[-2:]))
 
     def wait_for_access(self, page):
-        self.log("Chrome started. If LinkedIn asks for sign-in or verification, complete it in Chrome; the program will wait.")
+        self.log("Chrome started. Complete LinkedIn sign-in/security checks in Chrome if requested.")
         deadline = time.time() + 900
         while time.time() < deadline and not self.stop_event.is_set():
             url = page.url.lower()
-            if "linkedin.com" in url and "/login" not in url and "/checkpoint" not in url and "challenge" not in url:
+            if "linkedin.com" in url and not any(x in url for x in ("/login", "/checkpoint", "challenge")):
                 return True
             time.sleep(1)
         return False
 
-    def extract_cards(self, page):
+    def find_result_links(self, page):
         selectors = [
-            "li.reusable-search__result-container",
-            "div[data-view-name='search-entity-result-universal-template']",
-            "div.search-result__wrapper",
+            "main a[href*='/in/']",
+            "div[role='main'] a[href*='/in/']",
+            "a[href*='/in/']",
         ]
-        cards = []
         for selector in selectors:
             try:
                 loc = page.locator(selector)
-                if loc.count() > 0:
-                    cards = [loc.nth(i) for i in range(min(loc.count(), 200))]
-                    break
+                count = loc.count()
+                if count:
+                    return [loc.nth(i) for i in range(min(count, 200))]
             except Exception:
-                continue
-        if not cards:
-            # Fallback: profile links grouped by nearest li/article/section.
-            links = page.locator("a[href*='/in/']")
-            n = min(links.count(), 200)
-            for i in range(n):
+                pass
+        return []
+
+    def extract_lead_from_link(self, link):
+        try:
+            href = link.get_attribute("href") or ""
+            if "/in/" not in href:
+                return None
+            href = "https://www.linkedin.com" + href if href.startswith("/") else href
+            href = href.split("?")[0].rstrip("/")
+
+            name = clean(link.inner_text(timeout=800))
+            if not name:
                 try:
-                    cards.append(links.nth(i).locator("xpath=ancestor::*[self::li or self::article or @role='listitem'][1]"))
+                    name = clean(link.get_attribute("aria-label") or "")
                 except Exception:
                     pass
-        return cards
 
-    def extract_lead(self, card):
-        try:
-            links = card.locator("a[href*='/in/']")
-            if links.count() == 0:
-                return None
-            href = links.first.get_attribute("href") or ""
-            if not href:
-                return None
-            href = "https://www.linkedin.com" + href if href.startswith("/") else href.split("?")[0]
-
-            name = ""
-            for sel in [
-                ".entity-result__title-text a",
-                ".entity-result__title-text",
-                "a[href*='/in/'] span",
-                "a[href*='/in/']",
-            ]:
+            container = None
+            for xpath in (
+                "xpath=ancestor::li[1]",
+                "xpath=ancestor::article[1]",
+                "xpath=ancestor::*[@role='listitem'][1]",
+            ):
                 try:
-                    value = clean(card.locator(sel).first.inner_text(timeout=800))
-                    if value:
-                        name = value
+                    candidate = link.locator(xpath)
+                    if candidate.count():
+                        container = candidate
                         break
                 except Exception:
                     pass
+
+            text = clean(container.inner_text(timeout=1200)) if container else name
+            lines = unique_lines(container.inner_text(timeout=1200) if container else name)
 
             headline = ""
             location = ""
-            company = ""
             snippet = ""
-            for sel in [".entity-result__primary-subtitle", "div.t-14.t-black.t-normal"]:
-                try:
-                    headline = clean(card.locator(sel).first.inner_text(timeout=500))
-                    if headline:
-                        break
-                except Exception:
-                    pass
-            for sel in [".entity-result__secondary-subtitle", "div.t-14.t-normal"]:
-                try:
-                    location = clean(card.locator(sel).first.inner_text(timeout=500))
-                    if location:
-                        break
-                except Exception:
-                    pass
-            for sel in [".entity-result__summary", ".search-result__snippets"]:
-                try:
-                    snippet = clean(card.locator(sel).first.inner_text(timeout=500))
-                    if snippet:
-                        break
-                except Exception:
-                    pass
+            if container:
+                for selector in (
+                    ".entity-result__primary-subtitle",
+                    "[data-anonymize='job-title']",
+                    "div.t-14.t-black.t-normal",
+                ):
+                    try:
+                        value = clean(container.locator(selector).first.inner_text(timeout=500))
+                        if value:
+                            headline = value
+                            break
+                    except Exception:
+                        pass
+                for selector in (
+                    ".entity-result__secondary-subtitle",
+                    "[data-anonymize='location']",
+                    "div.t-14.t-normal",
+                ):
+                    try:
+                        value = clean(container.locator(selector).first.inner_text(timeout=500))
+                        if value:
+                            location = value
+                            break
+                    except Exception:
+                        pass
+                for selector in (
+                    ".entity-result__summary",
+                    ".search-result__snippets",
+                    "[data-anonymize='summary']",
+                ):
+                    try:
+                        value = clean(container.locator(selector).first.inner_text(timeout=500))
+                        if value:
+                            snippet = value
+                            break
+                    except Exception:
+                        pass
 
-            lines = unique_lines(card.inner_text(timeout=1000))
-            if lines:
-                if not name:
-                    name = lines[0]
-                if not headline and len(lines) > 1:
-                    headline = lines[1]
-                if not location and len(lines) > 2:
-                    location = lines[-1]
+            if not name and lines:
+                name = lines[0]
+            if not headline and len(lines) > 1:
+                headline = lines[1]
+            if not location and len(lines) > 2:
+                location = lines[-1]
 
-            # Best-effort company extraction from common entity metadata.
-            for sel in [".entity-result__primary-subtitle", "[data-anonymize='company-name']"]:
-                try:
-                    txt = clean(card.locator(sel).first.inner_text(timeout=400))
-                    if txt and company == "":
-                        company = txt
-                except Exception:
-                    pass
+            company = ""
+            try:
+                company = clean(container.locator("[data-anonymize='company-name']").first.inner_text(timeout=400))
+            except Exception:
+                pass
 
-            return Lead(name=name, headline=headline, location=location, company=company,
-                        profile_url=href, snippet=snippet, collected_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+            return Lead(
+                name=name,
+                headline=headline,
+                location=location,
+                company=company,
+                profile_url=href,
+                snippet=snippet or text,
+                collected_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
         except Exception:
             return None
 
-    def enrich_profile(self, page, lead: Lead):
+    def collect_page(self, page, records, limit):
+        links = self.find_result_links(page)
+        self.log(f"Detected {len(links)} LinkedIn profile links on this page.")
+        added = 0
+        for link in links:
+            if self.stop_event.is_set() or not limit.can_profile():
+                break
+            while self.pause_event.is_set() and not self.stop_event.is_set():
+                time.sleep(0.5)
+            lead = self.extract_lead_from_link(link)
+            if not lead or not lead.profile_url:
+                continue
+            key = lead.profile_url.lower()
+            if key in records:
+                continue
+            records[key] = lead
+            limit.register_profile()
+            added += 1
+            self.ui.put(("count", len(records), added))
+            self.limits(limit)
+        return len(links), added
+
+    def enrich_profile(self, page, lead):
         try:
             page.goto(lead.profile_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(1.5)
-            if "/login" in page.url.lower() or "/checkpoint" in page.url.lower():
+            if any(x in page.url.lower() for x in ("/login", "/checkpoint", "challenge")):
                 return
-            title = clean(page.title())
-            if title and not lead.name:
+            if not lead.name:
+                title = clean(page.title())
                 lead.name = title.split("|")[0].strip()
-
+            main = page.locator("main")
+            body = clean(main.inner_text(timeout=2000))
             candidates = []
-            for sel in [
-                "div.text-body-medium",
-                "div.pv-text-details__left-panel div.text-body-medium",
-                "main h2",
-                "main section div.text-body-medium",
-            ]:
+            for selector in ("div.text-body-medium", "main h2", "[data-anonymize='headline']"):
                 try:
-                    n = page.locator(sel).count()
-                    for i in range(min(n, 5)):
-                        txt = clean(page.locator(sel).nth(i).inner_text(timeout=500))
-                        if txt:
-                            candidates.append(txt)
+                    for i in range(min(main.locator(selector).count(), 5)):
+                        value = clean(main.locator(selector).nth(i).inner_text(timeout=500))
+                        if value:
+                            candidates.append(value)
                 except Exception:
                     pass
-            for c in candidates:
-                if c != lead.name and len(c) < 160:
-                    if not lead.headline:
-                        lead.headline = c
-                    break
-
-            try:
-                body = clean(page.locator("main").inner_text(timeout=1500))
-                if not lead.location:
-                    lines = unique_lines(body)
-                    for line in lines:
-                        if any(x in line.lower() for x in ["sweden", "stockholm", "gothenburg", "malmö", "skåne", "brazil", "sverige"]):
-                            lead.location = line
-                            break
-            except Exception:
-                pass
+            if not lead.headline:
+                for value in candidates:
+                    if value.lower() != lead.name.lower() and len(value) < 180:
+                        lead.headline = value
+                        break
+            if not lead.location:
+                for line in unique_lines(body):
+                    low = line.lower()
+                    if any(word in low for word in (
+                        "sweden", "sverige", "stockholm", "gothenburg", "göteborg",
+                        "malmö", "skåne", "brazil", "brasil"
+                    )):
+                        lead.location = line
+                        break
         except Exception:
             pass
 
     def run(self, settings):
         self.stop_event.clear()
         self.pause_event.clear()
-        found = new = 0
         records = {}
-        limits = DailyLimit(max_profiles=int(settings["max_profiles"]), max_searches=int(settings["max_searches"]))
-        self.ui.put(("limits", limits.profiles, limits.max_profiles, limits.searches, limits.max_searches))
+        limit = DailyLimit(settings["max_profiles"], settings["max_searches"])
+        self.limits(limit)
+        context = None
+
         try:
-            target = self.build_url(settings["search_url"], settings["keywords"], settings["title"], settings["location"])
-            max_pages = max(1, int(settings["pages"]))
-            visit_profiles = settings["visit_profiles"]
+            target = self.build_url(
+                settings["search_url"], settings["keywords"],
+                settings["title"], settings["location"]
+            )
+            pages = max(1, int(settings["pages"]))
 
             with sync_playwright() as pw:
                 context = self.launch_chrome(pw)
                 page = context.pages[0] if context.pages else context.new_page()
+
                 self.log("Opening LinkedIn search…")
                 page.goto(target, wait_until="domcontentloaded", timeout=60000)
-
                 if not self.wait_for_access(page):
                     self.log("Stopped waiting for LinkedIn access.")
-                    context.close()
                     return
 
-                for page_no in range(1, max_pages + 1):
+                for page_no in range(1, pages + 1):
                     if self.stop_event.is_set():
-                        break
-                    if not limits.can_search():
-                        self.log(f"Daily search limit reached: {limits.searches}/{limits.max_searches}.")
-                        break
-                    limits.register_search()
-                    self.ui.put(("limits", limits.profiles, limits.max_profiles, limits.searches, limits.max_searches))
                         break
                     while self.pause_event.is_set() and not self.stop_event.is_set():
                         time.sleep(0.5)
 
-                    if page_no > 1:
-                        page.goto(self.next_page_url(target, page_no), wait_until="domcontentloaded", timeout=60000)
-
-                    time.sleep(max(1.0, settings["delay"]))
-                    if "checkpoint" in page.url.lower() or "challenge" in page.url.lower():
-                        self.log("LinkedIn security verification detected. Complete it in Chrome; scraping is paused.")
-                        while ("checkpoint" in page.url.lower() or "challenge" in page.url.lower()) and not self.stop_event.is_set():
-                            time.sleep(1)
-                        if self.stop_event.is_set():
-                            break
-
-                    cards = self.extract_cards(page)
-                    self.log(f"Page {page_no}: {len(cards)} result cards detected.")
-                    before = len(records)
-
-                    for card in cards:
-                        if self.stop_event.is_set() or not limits.can_profile():
-                            if not limits.can_profile():
-                                self.log(f"Daily profile limit reached: {limits.profiles}/{limits.max_profiles}.")
-                            break
-                        while self.pause_event.is_set() and not self.stop_event.is_set():
-                            time.sleep(0.5)
-                        lead = self.extract_lead(card)
-                        if not lead or not lead.profile_url:
-                            continue
-                        key = lead.profile_url.rstrip("/").lower()
-                        if key not in records:
-                            records[key] = lead
-                            new += 1
-                            limits.register_profile()
-                            self.ui.put(("limits", limits.profiles, limits.max_profiles, limits.searches, limits.max_searches))
-                        found += 1
-                        self.count(found, new)
-
-                    self.log(f"Page {page_no}: {len(records)-before} new contacts.")
-                    if not cards:
-                        self.log("No result cards found; stopping pagination.")
+                    if not limit.can_search():
+                        self.log(f"Daily search limit reached: {limit.searches}/{limit.max_searches}.")
                         break
 
-                if visit_profiles and records:
-                    profile_page = context.new_page()
-                    for idx, lead in enumerate(list(records.values()), 1):
+                    if page_no > 1:
+                        page.goto(self.page_url(target, page_no),
+                                  wait_until="domcontentloaded", timeout=60000)
+
+                    limit.register_search()
+                    self.limits(limit)
+                    time.sleep(max(1.0, float(settings["delay"])))
+
+                    if any(x in page.url.lower() for x in ("/checkpoint", "challenge")):
+                        self.log("LinkedIn security verification detected. Complete it in Chrome; scraping is paused.")
+                        while any(x in page.url.lower() for x in ("/checkpoint", "challenge")) and not self.stop_event.is_set():
+                            time.sleep(1)
+
+                    before = len(records)
+                    link_count, added = self.collect_page(page, records, limit)
+                    self.log(f"Page {page_no}: {added} new contacts, {len(records)} unique total.")
+
+                    if link_count == 0:
+                        self.log("No LinkedIn profile links found; stopping pagination.")
+                        break
+                    if not limit.can_profile():
+                        self.log(f"Daily profile limit reached: {limit.profiles}/{limit.max_profiles}.")
+                        break
+
+                if settings["visit_profiles"] and records:
+                    self.log("Enriching visible profile details in the same Chrome tab…")
+                    for index, lead in enumerate(list(records.values()), 1):
                         if self.stop_event.is_set():
                             break
                         while self.pause_event.is_set() and not self.stop_event.is_set():
                             time.sleep(0.5)
-                        self.log(f"Enriching profile {idx}/{len(records)}: {lead.name or lead.profile_url}")
-                        self.enrich_profile(profile_page, lead)
-                    profile_page.close()
+                        self.log(f"Profile {index}/{len(records)}: {lead.name or lead.profile_url}")
+                        self.enrich_profile(page, lead)
 
-                context.close()
+                leads = list(records.values())
+                self.export(leads, settings["output"])
+                self.log(f"FINISHED. {len(leads)} unique contacts exported.")
+                self.ui.put(("done", str(settings["output"]), len(leads)))
 
-            leads = list(records.values())
-            self.export(leads, settings["output"])
-            self.log(f"FINISHED. {len(leads)} unique contacts exported.")
-            self.ui.put(("done", str(settings["output"]), len(leads)))
         except Exception as exc:
-            self.log(f"ERROR: {exc}")
+            self.log("ERROR: " + str(exc))
             self.ui.put(("error", str(exc)))
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
     def export(self, leads, output_path):
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
+        fields = list(asdict(Lead()).keys())
+
         csv_path = output.with_suffix(".csv")
-        with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=list(asdict(Lead()).keys()))
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for lead in leads:
                 writer.writerow(asdict(lead))
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Leads"
-        headers = list(asdict(Lead()).keys())
-        ws.append(headers)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Leads"
+        sheet.append(fields)
         for lead in leads:
             row = asdict(lead)
-            ws.append([row[h] for h in headers])
-        ws.freeze_panes = "A2"
-        for col in ws.columns:
-            width = min(60, max(12, max(len(str(c.value or "")) for c in col) + 2))
-            ws.column_dimensions[col[0].column_letter].width = width
-        wb.save(output)
+            sheet.append([row[field] for field in fields])
+        sheet.freeze_panes = "A2"
+        for column in sheet.columns:
+            width = min(60, max(12, max(len(str(cell.value or "")) for cell in column) + 2))
+            sheet.column_dimensions[column[0].column_letter].width = width
+        workbook.save(output)
 
     def start(self, settings):
         if self.thread and self.thread.is_alive():
@@ -462,37 +484,34 @@ class App:
         self.limit_status = tk.StringVar(value="Today: 0/20 profiles | 0/5 searches")
         self.found = tk.IntVar(value=0)
         self.new = tk.IntVar(value=0)
-
         self.build_ui()
         self.root.after(250, self.poll)
 
     def build_ui(self):
         outer = ttk.Frame(self.root, padding=16)
         outer.pack(fill="both", expand=True)
-
         ttk.Label(outer, text="PROSPECT HUNTER", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(outer, text="LinkedIn search collector — Chrome only").pack(anchor="w", pady=(0, 12))
 
         form = ttk.LabelFrame(outer, text="Search")
         form.pack(fill="x")
-
         rows = [
             ("Keywords", self.keywords),
             ("Title / role", self.title_var),
             ("Location", self.location),
             ("Exact LinkedIn search URL (optional)", self.search_url),
         ]
-        for r, (label, var) in enumerate(rows):
-            ttk.Label(form, text=label, width=30).grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            ttk.Entry(form, textvariable=var).grid(row=r, column=1, sticky="ew", padx=8, pady=6)
+        for row, (label, var) in enumerate(rows):
+            ttk.Label(form, text=label, width=30).grid(row=row, column=0, sticky="w", padx=8, pady=6)
+            ttk.Entry(form, textvariable=var).grid(row=row, column=1, sticky="ew", padx=8, pady=6)
         form.columnconfigure(1, weight=1)
 
         opts = ttk.LabelFrame(outer, text="Run options")
         opts.pack(fill="x", pady=12)
         ttk.Label(opts, text="Pages").grid(row=0, column=0, padx=8, pady=6, sticky="w")
         ttk.Spinbox(opts, from_=1, to=500, textvariable=self.pages, width=8).grid(row=0, column=1, padx=8, pady=6, sticky="w")
-        ttk.Label(opts, text="Delay / page (sec) — default 10").grid(row=0, column=2, padx=8, pady=6, sticky="w")
-        ttk.Spinbox(opts, from_=0.5, to=30, increment=0.5, textvariable=self.delay, width=8).grid(row=0, column=3, padx=8, pady=6, sticky="w")
+        ttk.Label(opts, text="Delay / page (sec)").grid(row=0, column=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(opts, from_=1, to=60, increment=1, textvariable=self.delay, width=8).grid(row=0, column=3, padx=8, pady=6, sticky="w")
         ttk.Checkbutton(opts, text="Visit profiles for extra visible details", variable=self.visit_profiles).grid(row=0, column=4, padx=12, pady=6, sticky="w")
         ttk.Label(opts, text="Profiles/day").grid(row=1, column=0, padx=8, pady=6, sticky="w")
         ttk.Spinbox(opts, from_=1, to=5000, textvariable=self.max_profiles, width=8).grid(row=1, column=1, padx=8, pady=6, sticky="w")
@@ -523,7 +542,7 @@ class App:
 
         self.log = tk.Text(outer, height=20, wrap="word")
         self.log.pack(fill="both", expand=True, pady=(8, 0))
-        self.log.insert("end", "Ready. Sign in to LinkedIn manually in the Chrome window when prompted.\n")
+        self.log.insert("end", "Ready. Sign in to LinkedIn manually in Chrome when prompted.\n")
         self.log.configure(state="disabled")
 
     def browse(self):
@@ -536,9 +555,9 @@ class App:
         if path:
             self.output.set(path)
 
-    def add_log(self, msg):
+    def add_log(self, message):
         self.log.configure(state="normal")
-        self.log.insert("end", msg + "\n")
+        self.log.insert("end", message + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -574,7 +593,9 @@ class App:
                     self.found.set(item[1])
                     self.new.set(item[2])
                 elif item[0] == "limits":
-                    self.limit_status.set(f"Today: {item[1]}/{item[2]} profiles | {item[3]}/{item[4]} searches")
+                    self.limit_status.set(
+                        f"Today: {item[1]}/{item[2]} profiles | {item[3]}/{item[4]} searches"
+                    )
                 elif item[0] == "done":
                     self.status.set("FINISHED")
                     self.add_log(f"Output: {item[1]} ({item[2]} unique)")
@@ -590,9 +611,5 @@ class App:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    try:
-        root.iconname(APP_NAME)
-    except Exception:
-        pass
     App(root)
     root.mainloop()
